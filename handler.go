@@ -5,16 +5,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/fatih/color"
 )
 
-// Handler implements slog.Handler to provide human-readable, colored output.
 type Handler struct {
-	opts slog.HandlerOptions
-	out  io.Writer
-	mu   *sync.Mutex
+	opts           slog.HandlerOptions
+	out            io.Writer
+	mu             *sync.Mutex
+	redactKeys     []string // Ключи для скрытия (Feature 4)
+	highlightKeys  []string // Ключи для выделения (Feature 3)
 }
 
 func NewHandler(out io.Writer, opts *slog.HandlerOptions) *Handler {
@@ -22,9 +25,11 @@ func NewHandler(out io.Writer, opts *slog.HandlerOptions) *Handler {
 		opts = &slog.HandlerOptions{}
 	}
 	return &Handler{
-		out:  out,
-		opts: *opts,
-		mu:   &sync.Mutex{},
+		out:           out,
+		opts:          *opts,
+		mu:            &sync.Mutex{},
+		redactKeys:    []string{"password", "token", "secret", "cookie", "api_key"},
+		highlightKeys: []string{"trace_id", "request_id", "user_id"},
 	}
 }
 
@@ -40,12 +45,11 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// 1. Format Time
-	timeStr := r.Time.Format("15:04:05")
-	timeCol := color.New(color.FgHiBlack).Sprint(timeStr)
+	// 1. Time (Black)
+	timeCol := color.New(color.FgHiBlack).Sprint(r.Time.Format("15:04:05"))
 
-	// 2. Format Level with colors
-	levelStr := "[" + r.Level.String() + "]"
+	// 2. Level (Colored)
+	levelStr := fmt.Sprintf("[%s]", r.Level.String())
 	var levelCol string
 	switch {
 	case r.Level >= slog.LevelError:
@@ -56,30 +60,62 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 		levelCol = color.New(color.FgCyan).Sprint(levelStr)
 	}
 
-	// 3. Format Message
+	// 3. Source Link (Feature 1: Absolute path for better clickability)
+    var sourceCol string
+    if h.opts.AddSource && r.PC != 0 {
+        fs := runtime.CallersFrames([]uintptr{r.PC})
+        f, _ := fs.Next()
+        // f.File содержит полный путь, например /Users/almaz/slog-human/example/main.go
+        sourceCol = color.New(color.FgHiBlack, color.Italic).Sprintf("%s:%d", f.File, f.Line)
+    }
+
+	// 4. Message (Bold White)
 	msgCol := color.New(color.FgWhite, color.Bold).Sprint(r.Message)
 
-	// 4. Format Attributes (Key-Value pairs)
-	attrs := ""
+	// 5. Attributes Processing (Features 2, 3, 4)
+	attrsStr := ""
 	r.Attrs(func(a slog.Attr) bool {
-		k := color.New(color.FgHiCyan).Sprint(a.Key)
-		v := fmt.Sprintf("%v", a.Value.Any())
-		attrs += fmt.Sprintf(" %s=%s", k, v)
+		key := strings.ToLower(a.Key)
+		val := a.Value.Any()
+
+		// Feature 4: Secret Redaction
+		for _, rk := range h.redactKeys {
+			if key == rk {
+				val = color.New(color.BgRed, color.FgWhite).Sprint("[REDACTED]")
+				break
+			}
+		}
+
+		// Feature 3: ID Highlighting
+		isID := false
+		for _, hk := range h.highlightKeys {
+			if key == hk {
+				isID = true
+				break
+			}
+		}
+
+		kCol := color.New(color.FgHiCyan).Sprint(a.Key)
+		vCol := fmt.Sprintf("%v", val)
+
+		if isID {
+			vCol = color.New(color.FgHiMagenta, color.Underline).Sprint(val)
+		}
+
+		// Feature 2: Multi-line for Errors
+		if err, ok := val.(error); ok {
+			vCol = color.New(color.FgRed).Sprintf("\n  └─> %v", err)
+		}
+
+		attrsStr += fmt.Sprintf(" %s=%s", kCol, vCol)
 		return true
 	})
 
-	// Print the final line
-	fmt.Fprintf(h.out, "%s %s %s%s\n", timeCol, levelCol, msgCol, attrs)
+	// Final Output
+	fmt.Fprintf(h.out, "%s %s %s %s%s\n", timeCol, levelCol, sourceCol, msgCol, attrsStr)
 
 	return nil
 }
 
-func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	// For simplicity in MVP, we return the same handler.
-	// Production-grade would handle nested attributes.
-	return h
-}
-
-func (h *Handler) WithGroup(name string) slog.Handler {
-	return h
-}
+func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *Handler) WithGroup(name string) slog.Handler      { return h }
